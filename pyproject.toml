@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantbt"
+version = "0.1.0"
+description = "A股量化策略回测平台 — correct backtesting with attribution you can use"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "akshare>=1.14.0",
+    "baostock>=1.0.0",
+    "rich>=13.0.0",
+    "click>=8.0.0",
+    "plotly>=5.15.0",
+    "statsmodels>=0.14.0",
+    "scipy>=1.10.0",
+]
+
+[project.scripts]
+quantbt = "quantbt.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quantbt*"]
