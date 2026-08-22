@@ -25,25 +25,12 @@ COLUMN_MAP = {
 
 REQUIRED_COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
-# 6-digit prefixes → exchange inference
-SH_PREFIXES = ("600", "601", "603", "605", "688", "689")
-SZ_PREFIXES = ("000", "001", "002", "003", "300", "301")
-
-
-def _infer_exchange(symbol: str) -> str:
-    """Infer exchange from A-share stock code prefix."""
-    clean = symbol.replace(".SH", "").replace(".SZ", "").strip()
-    if clean.startswith(SH_PREFIXES):
-        return "SH"
-    if clean.startswith(SZ_PREFIXES):
-        return "SZ"
-    raise ValueError(f"Cannot infer exchange for symbol: {symbol}")
-
-
 class AKShareAStockSource(DataSource):
-    """Fetch A-share daily data via AKShare with forward-adjusted prices.
+    """Fetch A-share daily data via AKShare.
 
-    Uses ``ak.stock_zh_a_hist()`` with ``adjust="qfq"`` (前复权).
+    Queries twice per symbol: ``adjust=""`` (不复权, for trading/valuation)
+    and ``adjust="hfq"`` (后复权, for signals/total return). Columns:
+    ``close`` = hfq close, ``raw_close`` = unadjusted close.
     """
 
     def __init__(self, delay: float = 0.5):
@@ -62,33 +49,48 @@ class AKShareAStockSource(DataSource):
 
         result = {}
         for sym in symbols:
+            code = sym.replace(".SH", "").replace(".SZ", "").strip()
             try:
-                exchange = _infer_exchange(sym)
                 raw = ak.stock_zh_a_hist(
-                    symbol=sym.replace(".SH", "").replace(".SZ", "").strip(),
+                    symbol=code,
                     period="daily",
                     start_date=start_str,
                     end_date=end_str,
-                    adjust="qfq",
+                    adjust="",  # 不复权
+                )
+                hfq = ak.stock_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=start_str,
+                    end_date=end_str,
+                    adjust="hfq",  # 后复权
                 )
             except Exception as e:
                 warnings.warn(f"Failed to fetch {sym}: {e}")
                 continue
 
-            if raw is None or raw.empty:
+            if raw is None or raw.empty or hfq is None or hfq.empty:
                 warnings.warn(f"No data returned for {sym}")
                 continue
 
             df = raw.rename(columns=COLUMN_MAP)
+            df_hfq = hfq.rename(columns=COLUMN_MAP)[["date", "close"]].rename(
+                columns={"close": "close_hfq"}
+            )
+            df = df.merge(df_hfq, on="date", how="outer").sort_values("date")
             df["date"] = pd.to_datetime(df["date"])
-            df = df.sort_values("date")
 
             # AKShare reports volume in 手 (lots); normalize to shares so the
             # broker's volume-limit math matches the baostock source (shares).
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce") * 100
 
-            # AKShare with qfq returns adjusted prices → use close as adj_close
+            # close = 后复权(信号/总回报口径); raw_close = 不复权(撮合/估值口径)。
+            df["raw_close"] = pd.to_numeric(df["close"], errors="coerce")
+            df["close"] = pd.to_numeric(df["close_hfq"], errors="coerce")
+            df = df.drop(columns=["close_hfq"])
             df["adj_close"] = df["close"].values
+            for col in ["open", "high", "low", "close", "raw_close", "adj_close"]:
+                df[col] = df[col].ffill()
 
             # Validate required columns
             missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]

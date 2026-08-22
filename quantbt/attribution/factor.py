@@ -94,6 +94,19 @@ class FactorAnalyzer:
         return pd.DataFrame(results, index=index)
 
     def build_market_factor(self, returns: pd.DataFrame) -> pd.DataFrame:
-        """Construct equal-weighted market factor from universe returns."""
+        """Construct the equal-weighted market factor (daily returns).
+
+        A factor fed into ``fit()`` / ``rolling_fit()`` must be a series
+        of returns. Cumulative NAV curves are a different object and
+        produce garbage loadings — use ``build_market_index`` for those.
+        """
+        market = returns.mean(axis=1)
+        return pd.DataFrame({"market": market})
+
+    def build_market_index(self, returns: pd.DataFrame) -> pd.DataFrame:
+        """Construct the equal-weighted market cumulative NAV curve.
+
+        For display only; not a regression input.
+        """
         market = returns.mean(axis=1)
         return pd.DataFrame({"market": (1 + market).cumprod()})

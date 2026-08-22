@@ -21,7 +21,7 @@ class DailyScheduler:
     """Orchestrates the daily live trading workflow.
 
     Daily flow:
-    1. Fetch latest market data (AKShare)
+    1. Fetch latest market data (baostock)
     2. Generate strategy signals
     3. Connect to 同花顺
     4. Execute rebalance
@@ -67,7 +67,7 @@ class DailyScheduler:
         end = today.isoformat()
 
         # Step 1: Fetch data
-        logger.info("Fetching data for %d stocks from AKShare...", len(self.stock_pool))
+        logger.info("Fetching data for %d stocks from baostock...", len(self.stock_pool))
         data = self._fetch_data(start, end)
         if data is None or data.empty:
             logger.error("Failed to fetch market data")
@@ -142,14 +142,21 @@ class DailyScheduler:
     ) -> list[dict]:
         """Run daily for approximately one month.
 
-        In persistent mode, sleeps until next trading day.
-        For non-persistent (scheduled) mode, call run_once daily via task scheduler.
+        Skips weekends and (when the exchange calendar is reachable)
+        holidays. In persistent mode, sleeps until the next trading day;
+        for non-persistent (scheduled) mode, call run_once daily via the
+        task scheduler.
         """
         results = []
+        start = date.today()
+        trading_days = self._trading_days(start, start + timedelta(days=max_days))
         for day in range(max_days):
-            today = date.today() + timedelta(days=day)
+            today = start + timedelta(days=day)
             if today.weekday() >= 5:
                 logger.info("%s is weekend, skipping", today)
+                continue
+            if trading_days and today not in trading_days:
+                logger.info("%s is an exchange holiday, skipping", today)
                 continue
             result = self.run_once(today=today, dry_run=dry_run)
             results.append(result)
@@ -157,28 +164,64 @@ class DailyScheduler:
 
         return results
 
+    @staticmethod
+    def _trading_days(start: date, end: date) -> set[date]:
+        """Fetch the exchange trading calendar via baostock.
+
+        Returns an empty set (weekday-only filtering) when the calendar
+        is unreachable, with an explicit warning — holidays would then
+        fetch empty data and surface as errors in run_once.
+        """
+        try:
+            import baostock as bs
+
+            bs.login()
+            try:
+                rs = bs.query_trade_dates(
+                    start_date=start.isoformat(), end_date=end.isoformat()
+                )
+                days: set[date] = set()
+                while rs.error_code == "0" and rs.next():
+                    row = rs.get_row_data()
+                    if len(row) > 1 and row[1] == "1":
+                        days.add(date.fromisoformat(row[0]))
+                return days
+            finally:
+                bs.logout()
+        except Exception as e:  # noqa: BLE001 - calendar is best-effort
+            logger.warning(
+                "Exchange calendar unavailable (%s); falling back to "
+                "weekday-only filtering",
+                e,
+            )
+            return set()
+
     def _fetch_data(self, start: str, end: str) -> pd.DataFrame | None:
-        """Fetch OHLCV data for stock pool via Baostock."""
+        """Fetch OHLCV data for the stock pool via baostock."""
         try:
             from quantbt.data.baostock_source import BaostockSource
+            from quantbt.data.assemble import assemble_data
 
             source = BaostockSource()
             raw = source.fetch(self.stock_pool, start, end)
             if not raw:
                 return None
-
-            from quantbt.api import Backtest
-            bt = Backtest(strategy=self.strategy, symbols=[])
-            return bt._assemble_data(raw)
+            return assemble_data(raw)
         except Exception as e:
             logger.error("Data fetch error: %s", e)
             return None
 
     def _get_prices(self, data: pd.DataFrame) -> pd.Series | None:
-        """Extract latest close prices from MultiIndex DataFrame."""
+        """Extract the latest REAL (unadjusted) closes from MultiIndex data.
+
+        Live orders must be sized and priced on unadjusted closes —
+        adjusted prices are a signal/total-return space, not the market.
+        """
         try:
             if isinstance(data.columns, pd.MultiIndex):
-                return data.iloc[-1].xs("close", level=1)
+                fields = data.columns.get_level_values(1)
+                field = "raw_close" if "raw_close" in fields else "close"
+                return data.iloc[-1].xs(field, level=1)
             return data.iloc[-1]
         except Exception as e:
             logger.error("Price extraction error: %s", e)

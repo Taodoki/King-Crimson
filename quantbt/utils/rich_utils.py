@@ -115,7 +115,8 @@ def print_backtest_summary(result) -> None:
 
         console.print(
             Panel(
-                f"[bold]Benchmark:[/] {result.benchmark_name}  |  "
+                f"[bold]Benchmark:[/] {result.benchmark_name} "
+                f"(price index)  |  "
                 f"[bold]Excess Return:[/] {_pct(excess)}  |  "
                 f"[bold]Tracking Error:[/] {_pct(te)}",
                 title="Benchmark Comparison",

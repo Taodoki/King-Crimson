@@ -24,7 +24,8 @@ class LiveExecutor:
     1. Read current positions (fail-closed: abort if unreadable)
     2. Get target positions from strategy weights
     3. Compute diff: what to buy / sell
-    4. Cap buys by available cash; enforce T+1 on sells
+    4. Sell first (proceeds fund buys), cap buys by available cash;
+       enforce T+1 on sells
     5. Produce a human-executable order list
     """
 
@@ -75,8 +76,17 @@ class LiveExecutor:
 
         bought_today = bought_today or {}
 
-        # Target shares: signal weight applied to available cash
-        target_value = target_weights * cash
+        # Target shares: signal weight applied to TOTAL equity (cash +
+        # current holdings marked at today's prices). Basing targets on
+        # cash alone computes near-zero targets on rotation days, when
+        # most equity sits in the positions about to be sold.
+        def _px(sym: str) -> float:
+            p = prices.get(sym)
+            return 0.0 if p is None or pd.isna(p) or p <= 0 else float(p)
+
+        holdings_value = float(sum(qty * _px(sym) for sym, qty in positions.items()))
+        total_equity = cash + holdings_value
+        target_value = target_weights * total_equity
         target_shares = (target_value / prices.replace(0, float("nan"))).fillna(0)
         target_shares = target_shares.astype(int)
         target_shares = (target_shares // self.min_volume) * self.min_volume
@@ -106,31 +116,10 @@ class LiveExecutor:
         )
 
         remaining_cash = cash
-        for sym in buy_symbols:
-            diff = target_shares.get(sym, 0) - positions.get(sym, 0)
-            price = prices.get(sym)
-            if price is None or pd.isna(price) or price <= 0:
-                errors.append({"symbol": sym, "reason": "no price", "side": "buy"})
-                continue
-
-            affordable = int(remaining_cash // price // self.min_volume) * self.min_volume
-            qty = min(diff, affordable)
-            if qty < self.min_volume:
-                errors.append({"symbol": sym, "reason": "insufficient cash", "side": "buy"})
-                continue
-
-            remaining_cash -= qty * price
-            trade_info = {"symbol": sym, "quantity": qty, "price": price}
-            if dry_run:
-                logger.info("[DRY RUN] Buy %s: %d @ %.2f", sym, qty, price)
-            else:
-                result = self.trader.buy(sym, price, qty)
-                if not result.success:
-                    errors.append({"symbol": sym, "reason": result.message, "side": "buy"})
-                    continue
-                logger.info("Buy %s: %d @ %.2f — %s", sym, qty, price, result.message)
-            buys.append(trade_info)
-
+        # Sells run first: on rotation days (sell A to buy B) the
+        # proceeds must enter the buy budget, otherwise buying power is
+        # understated and cash sits idle. Proceeds are net of estimated
+        # slippage; commission and stamp duty settle at the broker.
         for sym in sell_symbols:
             diff = target_shares.get(sym, 0) - positions.get(sym, 0)
             current = positions.get(sym, 0)
@@ -158,6 +147,32 @@ class LiveExecutor:
                     continue
                 logger.info("Sell %s: %d @ %.2f — %s", sym, qty, price, result.message)
             sells.append(trade_info)
+            remaining_cash += qty * price * (1 - self.slippage)
+
+        for sym in buy_symbols:
+            diff = target_shares.get(sym, 0) - positions.get(sym, 0)
+            price = prices.get(sym)
+            if price is None or pd.isna(price) or price <= 0:
+                errors.append({"symbol": sym, "reason": "no price", "side": "buy"})
+                continue
+
+            affordable = int(remaining_cash // price // self.min_volume) * self.min_volume
+            qty = min(diff, affordable)
+            if qty < self.min_volume:
+                errors.append({"symbol": sym, "reason": "insufficient cash", "side": "buy"})
+                continue
+
+            remaining_cash -= qty * price
+            trade_info = {"symbol": sym, "quantity": qty, "price": price}
+            if dry_run:
+                logger.info("[DRY RUN] Buy %s: %d @ %.2f", sym, qty, price)
+            else:
+                result = self.trader.buy(sym, price, qty)
+                if not result.success:
+                    errors.append({"symbol": sym, "reason": result.message, "side": "buy"})
+                    continue
+                logger.info("Buy %s: %d @ %.2f — %s", sym, qty, price, result.message)
+            buys.append(trade_info)
 
         return {
             "buys": buys,

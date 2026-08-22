@@ -161,20 +161,14 @@ class Backtest:
         _compute_benchmark(result, bench_ret, code)
 
     def _assemble_data(self, raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
-        """Combine individual symbol DataFrames into MultiIndex format."""
-        if not raw:
-            raise ValueError("No data returned from data source")
+        """Combine individual symbol DataFrames into MultiIndex format.
 
-        tickers = list(raw.keys())
-        dfs = []
-        for sym in tickers:
-            df = raw[sym].set_index("date")[["open", "high", "low", "close", "volume", "adj_close"]]
-            dfs.append(df)
+        Thin backward-compatible wrapper around the public
+        :func:`quantbt.data.assemble.assemble_data`.
+        """
+        from quantbt.data.assemble import assemble_data
 
-        combined = pd.concat(
-            dfs, axis=1, keys=tickers, names=["ticker", "field"]
-        ).dropna(how="all")
-        return combined
+        return assemble_data(raw)
 
 
 def _compute_benchmark(

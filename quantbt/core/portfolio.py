@@ -34,7 +34,10 @@ class Portfolio:
     def __init__(self, initial_capital: float = 1_000_000):
         self.initial_capital = initial_capital
         self._cash: float = initial_capital
-        self._holdings: dict[str, int] = {}
+        # Holdings can be fractional: on ex-dividend days the distribution
+        # is re-invested into the position, so share counts are a
+        # total-return bookkeeping unit, not an integer share count.
+        self._holdings: dict[str, float] = {}
         self._prices: dict[str, float] = {}
         self._history: list[PortfolioSnapshot] = []
         self._cum_ret: float = 1.0
@@ -98,7 +101,19 @@ class Portfolio:
         date: date,
         prices: pd.Series,
         trades: list[Trade],
+        adjust_factors: pd.Series | None = None,
     ) -> PortfolioSnapshot:
+        # 0. Corporate actions (ex-dividend days): re-invest the
+        #    distribution BEFORE marking to market. shares *= factor keeps
+        #    market value continuous across the ex-date, so the day's
+        #    return reflects price moves only (total-return convention).
+        if adjust_factors is not None:
+            for sym, factor in adjust_factors.items():
+                if factor is None or pd.isna(factor):
+                    continue
+                if abs(self._holdings.get(sym, 0.0)) > 0.0:
+                    self._holdings[sym] *= float(factor)
+
         # 1. Mark to market the holdings carried into `date`, at `date` close.
         #    Suspended symbols (NaN close) carry their last known price forward.
         if prices is not None:
@@ -132,7 +147,7 @@ class Portfolio:
             else:
                 self._cash += t.quantity * t.price - t.total_cost
                 self._holdings[t.symbol] = self._holdings.get(t.symbol, 0) - t.quantity
-                if self._holdings[t.symbol] == 0:
+                if abs(self._holdings[t.symbol]) < 1e-9:
                     del self._holdings[t.symbol]
                 # A negative balance is kept: it is an explicit short book,
                 # not a position to silently drop.

@@ -32,7 +32,7 @@ class Broker:
 
     A-share specifics:
     - Commission: 0.025%–0.03% of turnover, min 5 yuan per order
-    - Stamp duty: 0.05% on sell only (reformed 2024)
+    - Stamp duty: 0.05% on sell only (cut from 0.1% on 2023-08-28)
     - Slippage: configurable percentage of price
     - T+1 settlement: shares bought today cannot be sold today
     - Volume limit: max X% of daily volume per trade

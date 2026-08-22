@@ -15,7 +15,8 @@ def cli():
 @cli.command()
 @click.option("--strategy", "-s", required=True,
               type=click.Choice(["momentum", "mean_reversion"]))
-@click.option("--lookback", default=60, type=int)
+@click.option("--lookback", default=60, type=int,
+              help="Lookback window: N-day return for momentum, MA window for mean_reversion")
 @click.option("--symbols", required=True, help="Comma-separated stock codes")
 @click.option("--start", required=True, help="YYYY-MM-DD")
 @click.option("--end", required=True, help="YYYY-MM-DD")

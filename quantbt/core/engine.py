@@ -7,6 +7,15 @@ Two responsibilities, and only two:
 Both derive from the single Portfolio state object — the engine keeps no
 position book of its own.
 
+Dual price system:
+    * Trading, valuation and price-limit prices are REAL (unadjusted)
+      closes, so share counts, cash and volume limits match the actual
+      market. Synthetic data without a ``raw_close`` column falls back
+      to ``close`` (no corporate actions => the systems coincide).
+    * Strategy signals use adjusted closes (total-return space).
+    * On ex-dividend days the portfolio re-invests the distribution
+      (shares *= adjusted/raw ratio change), keeping value continuous.
+
 Matching convention (T+1 fills):
     * A fill executes at day ``t``'s close.
     * Day ``t``'s NAV reflects the holdings held *during* day ``t`` (the
@@ -98,18 +107,48 @@ class BacktestEngine:
             get_rebalance_dates(pd.DatetimeIndex(self.data.index), self.rebalance_freq)
         )
 
-        # Previous-day close, used by the broker for ±10% price limits.
         if isinstance(self.data.columns, pd.MultiIndex):
             close_all = self.data.xs("close", axis=1, level=1)
+            fields = self.data.columns.get_level_values(1)
+            has_raw = "raw_close" in fields
         else:
             close_all = self.data
-        prev_close_all = close_all.shift(1)
+            has_raw = False
+
+        # Trading, valuation and price-limit prices use REAL (unadjusted)
+        # closes; synthetic data without raw_close falls back to close.
+        if has_raw:
+            raw_close_all = self.data.xs("raw_close", axis=1, level=1)
+        else:
+            raw_close_all = close_all
+
+        # Previous-day real close, used by the broker for ±10% price limits.
+        prev_close_all = raw_close_all.shift(1)
+
+        # Trailing momentum used to break selection ties (see the
+        # max_positions block). Falls back to shorter windows on short
+        # histories. Computed on ADJUSTED closes (signal space).
+        momentum_all = (
+            close_all.pct_change(252)
+            .fillna(close_all.pct_change(60))
+            .fillna(0.0)
+        )
+
+        # Corporate-action factor: adjusted/raw price ratio. Constant
+        # between ex-dates (float noise ~1e-16), jumps on ex-dates.
+        # shares *= factor re-invests the distribution, keeping market
+        # value continuous across the ex-date (total-return convention).
+        ratio_all = close_all.ffill() / raw_close_all.replace(0, np.nan).ffill()
+        factor_all = ratio_all / ratio_all.shift(1)
+        factor_all = factor_all.where((factor_all - 1.0).abs() > 1e-6, 1.0)
 
         all_trades = []
 
         for dt in all_trading_dates:
             dt = pd.Timestamp(dt)
-            prices = self._get_field_at_date(dt, "close")
+            prices = self._get_field_at_date(
+                dt, "raw_close" if has_raw else "close"
+            )
             volumes = self._get_field_at_date(dt, "volume")
             trades = []
 
@@ -138,36 +177,131 @@ class BacktestEngine:
                 # yesterday's), so the realized weights match the signal.
                 total_equity = self.portfolio.value_at(prices)
                 cur = self.portfolio.holdings_series()
+                cash_before = self.portfolio.cash
 
-                target_value = weights * total_equity
-                # Floor to whole lots (100 shares) to avoid over-buying.
-                target_shares = (target_value / prices.replace(0, np.nan)).fillna(0.0)
-                target_shares = np.floor(target_shares / 100) * 100
+                prev_close = (
+                    prev_close_all.loc[dt] if dt in prev_close_all.index else None
+                )
 
                 if self.max_positions:
                     # Rank by target WEIGHT, not by share count: share counts
                     # scale with 1/price, so ranking shares would favor cheap
                     # stocks over the strategy's actual preferences.
-                    top = weights.abs().nlargest(self.max_positions)
-                    target_shares = target_shares.where(
-                        target_shares.index.isin(top.index), 0.0
+                    # Equal-weight signals (e.g. 0/1 momentum) tie on weight;
+                    # break ties by trailing momentum so top-max selection is
+                    # an explicit rule instead of silently following column
+                    # order.
+                    mom = momentum_all.loc[dt] if dt in momentum_all.index else 0.0
+                    rank = pd.DataFrame(
+                        {"weight": weights.abs(), "momentum": mom}
+                    )
+                    rank = rank.sort_values(
+                        ["weight", "momentum"],
+                        ascending=False,
+                        na_position="last",
+                    )
+                    top_idx = rank.index[: self.max_positions]
+                    weights = weights.where(weights.index.isin(top_idx), 0.0)
+
+                # Size the buy leg against the cash this rebalance itself
+                # raises, so the plan is affordable by construction. The
+                # sell leg (liquidations and trims) pays commission +
+                # stamp duty + slippage too; with long-only weights a
+                # turnover formula over target weights alone never sees
+                # it, so rotations used to leak sell costs into negative
+                # cash. Two-phase sizing:
+                #   1. Proportional shrink: scale the deployable by the
+                #      affordability ratio of the planned trades.
+                #   2. Lot-level safety net: 100-share lot flooring makes
+                #      buy notional a step function of the deployable, so
+                #      a proportional shrink can stall between two lots.
+                #      Drop one lot at a time from the largest planned
+                #      buy until the plan is exactly affordable. Each
+                #      pass strictly reduces buy notional, so this
+                #      terminates.
+                deployable = total_equity
+                target_shares: pd.Series | None = None
+                for _ in range(6):
+                    target_value = weights * deployable
+                    # Floor to whole lots (100 shares) to avoid over-buying.
+                    target_shares = (
+                        target_value / prices.replace(0, np.nan)
+                    ).fillna(0.0)
+                    target_shares = np.floor(target_shares / 100) * 100
+
+                    trades = self.broker.execute(
+                        target_positions=target_shares,
+                        current_positions=cur,
+                        prices=prices,
+                        volumes=volumes,
+                        date=dt,
+                        prev_close=prev_close,
+                        available_shares=cur,
+                    )
+                    buy_notional = sum(
+                        t.quantity * t.price for t in trades if t.side == "buy"
+                    )
+                    buy_costs = sum(
+                        t.total_cost for t in trades if t.side == "buy"
+                    )
+                    sell_net = sum(
+                        t.quantity * t.price - t.total_cost
+                        for t in trades
+                        if t.side == "sell"
+                    )
+                    available = cash_before + sell_net
+                    if buy_notional + buy_costs <= available + 1e-6:
+                        break
+                    deployable *= (
+                        max(available - buy_costs, 0.0) / buy_notional
+                        if buy_notional > 0
+                        else 0.0
                     )
 
-                prev_close = (
-                    prev_close_all.loc[dt] if dt in prev_close_all.index else None
-                )
-                trades = self.broker.execute(
-                    target_positions=target_shares,
-                    current_positions=cur,
-                    prices=prices,
-                    volumes=volumes,
-                    date=dt,
-                    prev_close=prev_close,
-                    available_shares=cur,
-                )
+                # Phase 2: exact affordability at lot granularity.
+                # Cut one lot at a time from the largest planned buy
+                # until the plan is affordable. Cutting the FILL itself
+                # (not the target shares) guarantees progress: a buy
+                # capped by the volume limit would not shrink if we only
+                # lowered its target, which could loop forever. Each pass
+                # reduces buy notional by >= one lot, so this terminates.
+                while True:
+                    buy_notional = sum(
+                        t.quantity * t.price for t in trades if t.side == "buy"
+                    )
+                    buy_costs = sum(
+                        t.total_cost for t in trades if t.side == "buy"
+                    )
+                    sell_net = sum(
+                        t.quantity * t.price - t.total_cost
+                        for t in trades
+                        if t.side == "sell"
+                    )
+                    available = cash_before + sell_net
+                    if buy_notional + buy_costs <= available + 1e-6:
+                        break
+                    buys = [t for t in trades if t.side == "buy"]
+                    if not buys:
+                        break  # nothing left to cut; plan already minimal
+                    biggest = max(buys, key=lambda t: t.quantity * t.price)
+                    qty = biggest.quantity - 100
+                    if qty <= 0:
+                        trades.remove(biggest)
+                        continue
+                    biggest.quantity = qty
+                    cost = self.broker.calculate_trade_cost(
+                        biggest.price, qty, "buy", biggest.date
+                    )
+                    biggest.commission = cost["commission"]
+                    biggest.stamp_duty = cost["stamp_duty"]
+                    biggest.slippage = cost["slippage"]
+                    biggest.total_cost = cost["total_cost"]
+
+            # Corporate-action factor for today (1.0 on ordinary days).
+            adjust = factor_all.loc[dt] if dt in factor_all.index else None
 
             # Mark to market every day; non-rebalance days pass trades=[].
-            self.portfolio.update(dt, prices, trades)
+            self.portfolio.update(dt, prices, trades, adjust_factors=adjust)
             all_trades.extend(trades)
 
         result.equity_curve = self.portfolio.equity_curve

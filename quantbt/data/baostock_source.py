@@ -19,6 +19,43 @@ def _to_baostock_code(symbol: str) -> str:
     return f"sz.{clean}"
 
 
+# baostock adjustflag: 1=后复权(hfq), 2=前复权(qfq), 3=不复权(raw)
+ADJ_RAW = "3"
+ADJ_HFQ = "1"
+
+
+def _query_k_data(
+    bs_code: str, start: str, end: str, adjustflag: str
+) -> pd.DataFrame | None:
+    """Query OHLCV via baostock; returns a numeric DataFrame or None.
+
+    Volume stays NaN on suspension days (never forward-filled) so the
+    broker's volume limit keeps rejecting orders on suspended days.
+    """
+    import baostock as bs
+
+    rs = bs.query_history_k_data_plus(
+        bs_code,
+        "date,open,high,low,close,volume",
+        start_date=start,
+        end_date=end,
+        frequency="d",
+        adjustflag=adjustflag,
+    )
+    rows = []
+    while rs.next():
+        rows.append(rs.get_row_data())
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"])
+    df["date"] = pd.to_datetime(df["date"])
+    # baostock volume is already in shares (unit-normalized with AKShare).
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.sort_values("date").reset_index(drop=True)
+
+
 class BaostockSource(DataSource):
     """Fetch A-share daily data via baostock.
 
@@ -40,34 +77,31 @@ class BaostockSource(DataSource):
         bs.login()
         result = {}
 
+        import warnings
+
         for sym in symbols:
             bs_code = _to_baostock_code(sym)
-            rs = bs.query_history_k_data_plus(
-                bs_code,
-                "date,open,high,low,close,volume",
-                start_date=start_str,
-                end_date=end_str,
-                frequency="d",
-                adjustflag="2",  # 1=不复权, 2=前复权, 3=后复权
-            )
+            raw = _query_k_data(bs_code, start_str, end_str, ADJ_RAW)
+            hfq = _query_k_data(bs_code, start_str, end_str, ADJ_HFQ)
 
-            rows = []
-            while rs.next():
-                row = rs.get_row_data()
-                rows.append(row)
-
-            if not rows:
-                import warnings
+            if raw is None or hfq is None:
                 warnings.warn(f"No data returned for {sym}")
                 continue
 
-            df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"])
-            df["date"] = pd.to_datetime(df["date"])
-            # baostock volume is already in shares (unit-normalized with AKShare).
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.sort_values("date")
+            # close = 后复权(信号/总回报口径); raw_close = 不复权(撮合/
+            # 估值/涨跌停口径)。open/high/low/volume 取不复权(真实盘口)。
+            # 停牌日价格沿用前收盘(估值连续)，成交量保持 NaN(不可成交)。
+            df = raw.merge(
+                hfq[["date", "close"]].rename(columns={"close": "close_hfq"}),
+                on="date",
+                how="outer",
+            ).sort_values("date").reset_index(drop=True)
+            df["raw_close"] = df["close"]
+            df["close"] = df["close_hfq"]
+            df = df.drop(columns=["close_hfq"])
             df["adj_close"] = df["close"].values
+            for col in ["open", "high", "low", "close", "raw_close", "adj_close"]:
+                df[col] = df[col].ffill()
             result[sym] = df
 
         bs.logout()
@@ -111,6 +145,11 @@ def fetch_index_returns(
 
     ``code`` must already be a baostock index code (e.g. ``sh.000300``).
     Returns a Series of daily returns indexed by date.
+
+    The index is a PRICE index (no dividend reinvestment): the benchmark
+    leg understates total return by roughly the A-share dividend yield
+    (~2-3%/yr), so treat benchmark-relative excess returns as a
+    diagnostic, not exact alpha.
     """
     import baostock as bs
 
@@ -125,7 +164,7 @@ def fetch_index_returns(
             start_date=start_str,
             end_date=end_str,
             frequency="d",
-            adjustflag="3",
+            adjustflag="3",  # indices have no adjustment concept; raw close
         )
         rows = []
         while rs.next():
